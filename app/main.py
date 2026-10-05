@@ -3,8 +3,16 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
+from .diagnose import diagnose_board
 from .inspector import inspect_board
-from .schemas import InspectRequest, InspectResponse, RouteRequest, RouteResponse
+from .schemas import (
+    DiagnoseRequest,
+    DiagnoseResponse,
+    InspectRequest,
+    InspectResponse,
+    RouteRequest,
+    RouteResponse,
+)
 from .solver import solve_board
 
 app = FastAPI(
@@ -34,3 +42,10 @@ def route(req: RouteRequest) -> RouteResponse:
 def inspect(req: InspectRequest) -> InspectResponse:
     # pure rule audit of the supplied candidate paths; no solving
     return inspect_board(req)
+
+
+@app.post("/diagnose-open", response_model=DiagnoseResponse)
+def diagnose_open(req: DiagnoseRequest) -> DiagnoseResponse:
+    # audit the candidate paths like /inspect, then localise at most one
+    # broken edge per net from the submitted continuity measurements
+    return diagnose_board(req)

@@ -1,7 +1,7 @@
 """Request/response schemas for the two-layer PCB grid router."""
 from __future__ import annotations
 
-from typing import Annotated, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -178,3 +178,96 @@ class InspectResponse(BaseModel):
     # true only when no rule was violated
     legal: bool
     violations: list[InspectViolation]
+
+
+# ----------------------------- POST /diagnose-open ---------------------------
+
+
+class DiagnoseCell(BaseModel):
+    """A probe position: a board cell on a specific layer.
+
+    Like /inspect path cells, coordinates are strict integers; a probe at
+    (x, y, 0) and one at (x, y, 1) are two DIFFERENT probes.
+    """
+
+    x: StrictInt
+    y: StrictInt
+    layer: StrictInt
+
+
+class Measurement(BaseModel):
+    """One continuity measurement on one net, taken between two probes.
+
+    result == "connected" means the two probes beep together; result ==
+    "open" (断开) means they do not.
+    """
+
+    # index of the measured net in the request's `nets` order
+    net: StrictInt
+    a: DiagnoseCell
+    b: DiagnoseCell
+    result: Literal["connected", "open"]
+
+
+class DiagnoseRequest(InspectRequest):
+    """Board definition + candidate paths (identical to /inspect) plus the
+    real-world continuity measurements used to localise an open edge."""
+
+    measurements: list[Measurement] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check_measurements(self) -> "DiagnoseRequest":
+        n_nets = len(self.nets)
+        seen_nets: set[int] = set()
+        for m in self.measurements:
+            if not (0 <= m.net < n_nets):
+                raise ValueError(
+                    f"measurement refers to net {m.net}, but only "
+                    f"{n_nets} nets are defined (valid indices 0..{n_nets - 1})"
+                )
+            seen_nets.add(m.net)
+        # every net must carry at least one real measurement
+        missing = sorted(set(range(n_nets)) - seen_nets)
+        if missing:
+            raise ValueError(
+                f"every net needs at least one measurement; missing "
+                f"measurement(s) for net(s) {missing}"
+            )
+        return self
+
+
+class DiagnoseEdge(BaseModel):
+    """One candidate broken (open) edge of a net's path."""
+
+    # step index of the edge within the path: it joins path[step] to
+    # path[step + 1] (a same-layer move or an in-place layer change)
+    step: int
+    # the two endpoint cells, in path order
+    cells: list[PathCell]
+
+
+class NetDiagnosis(BaseModel):
+    # index of the net in `nets` order
+    net: int
+    # the net's name when one was supplied, otherwise the default N{k+1}
+    name: str
+    # true iff at least one "open" record forces a broken edge on this net;
+    # a net with only "connected" records never needs a break
+    break_required: bool
+    # every single edge whose break would explain ALL of this net's records
+    # at once; empty when break_required is false or the records contradict
+    # each other (a shared global `consistent` flag reports that case)
+    candidate_edges: list[DiagnoseEdge]
+
+
+class DiagnoseResponse(BaseModel):
+    # true iff the whole measurement set is self-consistent under the
+    # "at most one broken edge per net" hypothesis; when false, each
+    # contradicting net's candidate list is empty while the other nets
+    # still report their own independently-derived candidates
+    consistent: bool
+    # true iff "no broken edge anywhere" explains every record -- possible
+    # only when every record is "connected" (and no records contradict)
+    no_break_possible: bool
+    # one entry per net, in net order
+    nets: list[NetDiagnosis]
