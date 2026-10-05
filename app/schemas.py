@@ -178,3 +178,71 @@ class InspectResponse(BaseModel):
     # true only when no rule was violated
     legal: bool
     violations: list[InspectViolation]
+
+
+# ---------------------------- POST /diagnose-open ---------------------------
+
+
+class ProbeCell(InspectCell):
+    """A probe point of an open-circuit measurement: a strict-integer
+    (x, y, layer) grid cell, exactly like a candidate-path step.  Probes
+    must locate on the referenced net's candidate path; otherwise the
+    request is rejected with HTTP 422 (probes are *references* to path
+    steps, never out-of-bounds user geometry as an /inspect step can be).
+    """
+
+
+# a JSON bool, strict: 0/1/"true" do not sneak in as a measurement result
+StrictBool = Annotated[bool, Field(strict=True)]
+
+
+class Measurement(BaseModel):
+    """One continuity measurement performed on one net.
+
+    ``a`` and ``b`` are the two layer-aware probe cells (a probe on
+    layer 0 at (x, y) is a *different* point from a layer-1 probe at the
+    same coordinate; the via edge between them is a distinct path edge).
+    ``connected`` is the meter reading: continuity / open.
+    """
+
+    net: StrictInt
+    a: ProbeCell
+    b: ProbeCell
+    connected: StrictBool
+
+
+class DiagnoseRequest(InspectRequest):
+    """Board definition plus candidate paths (identical to /inspect) and
+    the measured continuity records.  Every net must have at least one
+    measurement."""
+
+    measurements: list[Measurement] = Field(min_length=MIN_NETS)
+
+
+class BrokenEdge(BaseModel):
+    """One candidate open edge of one net's candidate path.
+
+    ``step`` is the 0-based path step index the edge leaves (the edge
+    path[step] -> path[step + 1]); ``cells`` are its two endpoint cells
+    in path order.  Candidate lists are sorted by ``step``.
+    """
+
+    step: int
+    cells: list[PathCell] = Field(min_length=2, max_length=2)
+
+
+class NetDiagnosis(BaseModel):
+    name: str
+    # false when the records can only be explained by one open edge of
+    # this net's path (at least one open reading was given); true when
+    # the no-break hypothesis also explains every reading
+    no_break_possible: bool
+    # every single path edge whose opening is consistent with ALL records,
+    # sorted by path step; empty when no such edge exists (conflicting
+    # readings) or when the net has no breakable edge
+    candidates: list[BrokenEdge]
+
+
+class DiagnoseResponse(BaseModel):
+    # one entry per net, ordered like `nets`
+    nets: list[NetDiagnosis]

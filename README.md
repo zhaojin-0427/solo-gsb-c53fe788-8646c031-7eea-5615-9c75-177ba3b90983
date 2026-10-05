@@ -16,6 +16,7 @@ docker compose up --build
 
 - `POST /route` — 布线接口（CP-SAT 联合求解）
 - `POST /inspect` — 走线审查接口（只校验给定候选路径，不重新求解）
+- `POST /diagnose-open` — 断路诊断接口（按实测通断记录推断候选断路边）
 - `GET  /health` — 健康检查
 - `GET  /docs` — Swagger UI 交互文档
 
@@ -456,6 +457,255 @@ curl -s -X POST http://localhost:8000/inspect \
 #   "msg":"Input should be a valid integer","input":0.5}]}
 ```
 
+## POST /diagnose-open
+
+断路诊断接口。请求沿用 `/inspect` 的**板面定义与按网序排列的候选路径**
+（`width`、`height`、`blocked`、`nets`、`paths`，同样先过板面校验和
+`inspect_board` 审查），另外给出一个 **`measurements`** 实测记录数组：
+**每条网至少一条**记录，记录之间可以任意排序。诊断不重新求解，只在给定
+候选路径上做区间裁决。
+
+### 假设与语义
+
+- 每条网**至多有一条路径边断路**；各网独立诊断（断边只在本网路径上）。
+- 路径边有两种：相邻两步同层的**同层移动边**，和坐标不变、层号切换的
+  **过孔换层边**；两者都是可断的路径边。
+- 探针是**含层**的格点 `(x, y, layer)`：同坐标第 0 层探针与第 1 层探针是
+  两个不同测点，其间隔着过孔边，**不得混作一格**。
+- 每条记录 `{"net", "a", "b", "connected"}`：网号 `net`，两个含层探针
+  `a`、`b`（都必须是该网候选路径上的格），`connected` 为万用表实测结果。
+- **交叉测量合并裁决**（按路径步号定位探针，与路径方向无关）：
+  - `connected: true`（连通）—— 两探针之间的路径段上**不可能有断边**，
+    排除该段全部边；
+  - `connected: false`（断开）—— 断边**必须落在**两探针之间的路径段上，
+    候选集与该段取交；
+  - 初始候选为该网全部边；全部记录合并后剩下的边即**能同时解释全部记录**
+    的断路边，按路径步号（边从 `path[step]` 到 `path[step+1]`）排序。
+- 两探针落在**同一个格点**时：连通记录不排除任何边；断开记录要求断边落在
+  空段上，永远无法满足（该网返回空候选）。
+- 只有连通记录时，"本网无断路"的假设同样成立，`no_break_possible` 为
+  `true`；出现过任何断开记录即为 `false`。存在断开记录但候选为空，表示
+  记录在"每网至多一条断边"假设下**互相冲突**。
+
+### 响应体
+
+| 字段 | 说明 |
+| --- | --- |
+| `nets` | 每网一条结果，按 `nets` 网序排列 |
+| `nets[].name` | 网络名（缺省为 `N1`、`N2`…） |
+| `nets[].no_break_possible` | "该网无断路"能否解释全部记录（有断开记录时恒为 `false`） |
+| `nets[].candidates` | 能解释全部记录的候选断路边，按路径步号升序；冲突或无断边时为 `[]` |
+| `nets[].candidates[].step` | 边的起点步号（边为 `path[step] → path[step+1]`） |
+| `nets[].candidates[].cells` | 断路边两端格，按路径方向给出（换层边即同坐标、两层各一格） |
+
+### 实际请求与响应示例
+
+下例为 5×5 板：N1 从 `(0,0)` 第 0 层借两个过孔绕到 `(2,2)` 第 0 层；
+N2 在第 0 层 `y=4` 直行。对 N1 有两条交叉测量——`(0,0,0)` 到 `(1,2,1)`
+连通（排除步 0~2 的边），`(1,2,1)` 到终点 `(2,2,0)` 断开（断边必须在
+步 3、4 上）；N2 全程实测连通。
+
+```bash
+curl -s -X POST http://localhost:8000/diagnose-open \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "width": 5,
+  "height": 5,
+  "nets": [
+    {"name": "N1", "pads": [{"x": 0, "y": 0, "layer": 0}, {"x": 2, "y": 2, "layer": 0}], "via_limit": 2},
+    {"name": "N2", "pads": [{"x": 0, "y": 4, "layer": 0}, {"x": 4, "y": 4, "layer": 0}], "via_limit": 0}
+  ],
+  "paths": [
+    [
+      {"x": 0, "y": 0, "layer": 0},
+      {"x": 1, "y": 0, "layer": 0},
+      {"x": 1, "y": 0, "layer": 1},
+      {"x": 1, "y": 1, "layer": 1},
+      {"x": 1, "y": 2, "layer": 1},
+      {"x": 1, "y": 2, "layer": 0},
+      {"x": 2, "y": 2, "layer": 0}
+    ],
+    [
+      {"x": 0, "y": 4, "layer": 0},
+      {"x": 1, "y": 4, "layer": 0},
+      {"x": 2, "y": 4, "layer": 0},
+      {"x": 3, "y": 4, "layer": 0},
+      {"x": 4, "y": 4, "layer": 0}
+    ]
+  ],
+  "measurements": [
+    {"net": 0, "a": {"x": 0, "y": 0, "layer": 0}, "b": {"x": 1, "y": 2, "layer": 1}, "connected": true},
+    {"net": 0, "a": {"x": 1, "y": 2, "layer": 1}, "b": {"x": 2, "y": 2, "layer": 0}, "connected": false},
+    {"net": 1, "a": {"x": 0, "y": 4, "layer": 0}, "b": {"x": 4, "y": 4, "layer": 0}, "connected": true}
+  ]
+}'
+```
+
+实际响应（N1 的断边只可能是步 4 的过孔边或步 5 的移动边；N2 无断路即可
+解释全部记录，候选为空）：
+
+```json
+{
+  "nets": [
+    {
+      "name": "N1",
+      "no_break_possible": false,
+      "candidates": [
+        {
+          "step": 4,
+          "cells": [
+            {"x": 1, "y": 2, "layer": 1},
+            {"x": 1, "y": 2, "layer": 0}
+          ]
+        },
+        {
+          "step": 5,
+          "cells": [
+            {"x": 1, "y": 2, "layer": 0},
+            {"x": 2, "y": 2, "layer": 0}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "N2",
+      "no_break_possible": true,
+      "candidates": []
+    }
+  ]
+}
+```
+
+### 冲突记录示例
+
+一条 5 格直路（边 0~3），两条断开记录分别落在互不相交的段上
+（边 0、1 与边 3），任何单条断边都无法同时解释，返回**空候选**：
+
+```bash
+curl -s -X POST http://localhost:8000/diagnose-open \
+  -H 'Content-Type: application/json' \
+  -d '{
+  "width": 5,
+  "height": 3,
+  "nets": [
+    {"name": "N1", "pads": [{"x": 0, "y": 0, "layer": 0}, {"x": 4, "y": 0, "layer": 0}], "via_limit": 0}
+  ],
+  "paths": [
+    [
+      {"x": 0, "y": 0, "layer": 0},
+      {"x": 1, "y": 0, "layer": 0},
+      {"x": 2, "y": 0, "layer": 0},
+      {"x": 3, "y": 0, "layer": 0},
+      {"x": 4, "y": 0, "layer": 0}
+    ]
+  ],
+  "measurements": [
+    {"net": 0, "a": {"x": 0, "y": 0, "layer": 0}, "b": {"x": 2, "y": 0, "layer": 0}, "connected": false},
+    {"net": 0, "a": {"x": 3, "y": 0, "layer": 0}, "b": {"x": 4, "y": 0, "layer": 0}, "connected": false}
+  ]
+}'
+```
+
+```json
+{
+  "nets": [
+    {
+      "name": "N1",
+      "no_break_possible": false,
+      "candidates": []
+    }
+  ]
+}
+```
+
+### 输入校验（HTTP 422）
+
+除继承 `/inspect` 的板面校验外，`/diagnose-open` 还有以下 422 情形，
+响应统一为 `{"detail": [ {"reason": ..., ...} ]}`，一次请求里的多条坏记录
+会**一并返回**：
+
+- **候选路径违规**（`reason: "path_violations"`）：任何 `/inspect` 违规项
+  在本接口都是 422，并在 `violations` 中附上**完整的 `/inspect` 违规列表**
+  （格式与 `/inspect` 响应中的元素完全一致）；
+- **非法网号**（`reason: "unknown_net"`）：`net` 越界（含负数），附
+  `measurement`、`net`；
+- **探针不在对应路径上**（`reason: "probe_not_on_path"`）：探针不是该网
+  候选路径的含层格点（越界、层号错误、坐标不符均属此类），附
+  `measurement`、`net`、`probe`（`"a"`/`"b"`）、`cell`；
+- **网无实测记录**（`reason: "no_measurements"`）：某条网没有任何有效
+  测量；
+- 缺少 `measurements`、空数组，探针坐标不是整数，`connected` 不是布尔值
+  （`0`/`1`/`"true"` 均拒绝）等畸形请求，由 Pydantic 返回 422。
+
+路径违规示例（第 1、2 步之间斜跳，附 `/inspect` 违规项）：
+
+```json
+{
+  "detail": [
+    {
+      "reason": "path_violations",
+      "msg": "candidate paths violate routing rules; see violations",
+      "violations": [
+        {
+          "rule": "NON_ORTHOGONAL_STEP",
+          "nets": [0],
+          "steps": [[1, 2]],
+          "cells": [
+            {"x": 1, "y": 0, "layer": 0},
+            {"x": 2, "y": 1, "layer": 0}
+          ],
+          "via_count": null,
+          "via_limit": null
+        },
+        {
+          "rule": "NON_ORTHOGONAL_STEP",
+          "nets": [0],
+          "steps": [[2, 3]],
+          "cells": [
+            {"x": 2, "y": 1, "layer": 0},
+            {"x": 3, "y": 0, "layer": 0}
+          ],
+          "via_count": null,
+          "via_limit": null
+        }
+      ]
+    }
+  ]
+}
+```
+
+探针不在路径上的示例（第二条记录的探针 `b` 不在 N1 路径上）：
+
+```json
+{
+  "detail": [
+    {
+      "reason": "probe_not_on_path",
+      "measurement": 1,
+      "net": 0,
+      "probe": "b",
+      "cell": {"x": 4, "y": 1, "layer": 0},
+      "msg": "measurement 1 probe 'b' at (4, 1, layer 0) is not a cell of net 0's candidate path"
+    }
+  ]
+}
+```
+
+非法网号示例：
+
+```json
+{
+  "detail": [
+    {
+      "reason": "unknown_net",
+      "measurement": 1,
+      "net": 7,
+      "msg": "measurement 1 references net 7, valid net indices are 0..0"
+    }
+  ]
+}
+```
+
 ## 实现要点
 
 - **模型**（`app/solver.py`）：每条网络建模为从 `pads[0]` 到 `pads[1]` 的
@@ -484,18 +734,31 @@ curl -s -X POST http://localhost:8000/inspect \
   步号保留）。越界与非法层以 `200` 返回违规；请求畸形
   （缺字段、路径数不符、非整数坐标、单路径超过 `2wh` 格）由 Pydantic
   返回 `422`。`tests/test_inspect.py` 覆盖全部规则、排序语义与 422。
+- **断路诊断**（`app/diagnoser.py`）：`POST /diagnose-open` 先跑一遍
+  `inspect_board`，候选路径只要有任何违规即以 `422` 返回并附上完整
+  `/inspect` 违规列表；随后把每条实测记录的两个含层探针定位到对应网的
+  有序路径（合法路径无重复格，按 `(x,y,layer)` 唯一定位；同坐标两层探针
+  是不同测点），非法网号、探针不在路径、某网无记录均返回 `422`。诊断按
+  网独立、每网至多一条断边：初始候选为全部路径边，断开记录与其探针间
+  路径段取交，连通记录减去其探针间路径段；同格探针的连通记录为中性、
+  断开记录不可满足；按步号输出候选边两端格，并以是否出现过断开记录决定
+  `no_break_possible`，冲突记录自然得到空候选。`tests/test_diagnose.py`
+  覆盖区间裁决、过孔换层边、同坐标两层探针、冲突记录、网序输出与全部 422。
 
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 入口，POST /route、POST /inspect、GET /health
+  main.py       # FastAPI 入口，POST /route、POST /inspect、
+                # POST /diagnose-open、GET /health
   schemas.py    # Pydantic 请求/响应模型与 422 校验
   solver.py     # CP-SAT 联合建模、启发式 hint、结果提取
   inspector.py  # /inspect 走线规则静态审查（不求解）
+  diagnoser.py  # /diagnose-open 实测通断记录的断路边区间裁决
 tests/
   test_router.py
   test_inspect.py
+  test_diagnose.py
 Dockerfile
 docker-compose.yml
 requirements.txt
